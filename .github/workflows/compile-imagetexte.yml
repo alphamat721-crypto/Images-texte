@@ -1,0 +1,115 @@
+name: Compiler ImageTexte
+
+on:
+  push:
+    paths:
+      - 'ImageTexte_v*.zip'
+      - '.github/workflows/compile-imagetexte.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Choisir le ZIP ImageTexte le plus récent
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          Z=$(find . -maxdepth 1 -type f -name 'ImageTexte_v*.zip' -printf '%f\n' | sort -V | tail -1)
+          if [ -z "$Z" ]; then
+            echo "Aucun fichier ImageTexte_vX.Y.Z.zip à la racine du dépôt."
+            exit 1
+          fi
+          V=$(echo "$Z" | sed -E 's/^ImageTexte_v([0-9.]+)\.zip$/\1/')
+          echo "zip=$Z" >> "$GITHUB_OUTPUT"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Archive sélectionnée : $Z (version $V)"
+
+      - name: Décompresser et contrôler le projet
+        id: proj
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf proj
+          mkdir proj
+          unzip -q "${{ steps.zip.outputs.zip }}" -d proj
+          S=$(find proj -maxdepth 5 -name settings.gradle.kts -print -quit)
+          if [ -z "$S" ]; then
+            echo "settings.gradle.kts introuvable dans l'archive."
+            exit 1
+          fi
+          P=$(dirname "$S")
+          test -f "$P/build.gradle.kts"
+          test -f "$P/app/build.gradle.kts"
+          test -f "$P/app/src/main/AndroidManifest.xml"
+          test -f "$P/app/src/main/java/com/imagetexte/app/MainActivity.java"
+          EMPTY=$(find "$P" -type f -size 0 ! -name '.gitkeep' -print)
+          if [ -n "$EMPTY" ]; then
+            echo "Fichiers vides détectés :"
+            echo "$EMPTY"
+            exit 1
+          fi
+          echo "dir=$P" >> "$GITHUB_OUTPUT"
+          echo "Projet contrôlé : $P"
+
+      - name: Accepter les licences Android et installer le SDK
+        shell: bash
+        run: |
+          set -e
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "platform-tools" >/dev/null
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Vérifier et compiler l'APK Release
+        run: |
+          gradle -p "${{ steps.proj.outputs.dir }}" \
+            assembleRelease --no-daemon --stacktrace
+
+      - name: Vérifier et préparer l'APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(find "${{ steps.proj.outputs.dir }}/app/build/outputs/apk/release" -type f -name '*.apk' -print -quit)
+          if [ -z "$APK" ]; then
+            echo "APK release introuvable."
+            exit 1
+          fi
+          cp "$APK" "ImageTexte_v${{ steps.zip.outputs.version }}.apk"
+          test -s "ImageTexte_v${{ steps.zip.outputs.version }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ImageTexte_v${{ steps.zip.outputs.version }}
+          path: ImageTexte_v${{ steps.zip.outputs.version }}.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publier dans GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="v${{ steps.zip.outputs.version }}"
+          gh release delete "$V" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$V" "ImageTexte_v${{ steps.zip.outputs.version }}.apk" \
+            --title "ImageTexte $V" \
+            --notes "ImageTexte $V — APK Android compilée par GitHub Actions."
