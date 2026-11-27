@@ -1,0 +1,94 @@
+name: Compilation APK
+
+on:
+  push:
+    paths:
+      - '**.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trouver le zip de plus haut numéro
+        id: zip
+        run: |
+          set -e
+          best=""; bestv=""
+          for f in *.zip; do
+            [ -e "$f" ] || continue
+            v=$(echo "$f" | sed -E 's/.*_v([0-9]+)[._]([0-9]+)[._]([0-9]+).*/\1.\2.\3/')
+            case "$v" in ""|*[!0-9.]*) continue ;; esac
+            if [ -z "$bestv" ] || [ "$(printf '%s\n%s\n' "$bestv" "$v" | sort -V | tail -1)" = "$v" ]; then
+              best="$f"; bestv="$v"
+            fi
+          done
+          if [ -z "$best" ]; then echo "Aucun zip nommé Nom_vX.Y.Z.zip"; exit 1; fi
+          echo "Zip retenu : $best (version $bestv)"
+          nom=$(echo "$best" | sed -E 's/_v[0-9]+[._][0-9]+[._][0-9]+.*//')
+          echo "fichier=$best" >> "$GITHUB_OUTPUT"
+          echo "version=$bestv" >> "$GITHUB_OUTPUT"
+          echo "nom=$nom" >> "$GITHUB_OUTPUT"
+
+      - name: Décompresser
+        run: |
+          rm -rf projet && mkdir projet
+          unzip -q "${{ steps.zip.outputs.fichier }}" -d projet
+          reglages=$(find projet -name settings.gradle.kts -not -path '*/build/*' | head -1)
+          if [ -z "$reglages" ]; then echo "settings.gradle.kts introuvable dans le zip"; exit 1; fi
+          echo "DOSSIER=$(dirname "$reglages")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compiler les deux versions
+        working-directory: ${{ env.DOSSIER }}
+        run: gradle --no-daemon --stacktrace assembleCompletRelease assembleLiteRelease
+
+      - name: Renommer les APK
+        run: |
+          v="${{ steps.zip.outputs.version }}"
+          n="${{ steps.zip.outputs.nom }}"
+          mkdir -p sortie
+          cp "$DOSSIER"/app/build/outputs/apk/complet/release/*.apk "sortie/${n}_v$v.apk"
+          cp "$DOSSIER"/app/build/outputs/apk/lite/release/*.apk "sortie/${n}_Lite_v$v.apk"
+          ls -la sortie
+
+      # Secours : les APK sont d'abord déposés dans l'exécution elle-même (Actions › exécution › « Artifacts »),
+      # pour pouvoir les télécharger même si GitHub est en panne au moment de créer la Release.
+      - name: Déposer les APK dans l'exécution (secours)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zip.outputs.nom }}_v${{ steps.zip.outputs.version }}_APK
+          path: sortie/*.apk
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      # Les branches d'essai compilent seulement ; la publication se fait depuis main.
+      - name: Publier dans Releases
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.zip.outputs.version }}
+          name: ${{ steps.zip.outputs.nom }} ${{ steps.zip.outputs.version }}
+          body: |
+            ${{ steps.zip.outputs.nom }}_v${{ steps.zip.outputs.version }}.apk : Android 8 et plus
+            ${{ steps.zip.outputs.nom }}_Lite_v${{ steps.zip.outputs.version }}.apk : Android 5.1 et plus
+          files: sortie/*.apk
